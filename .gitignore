@@ -1,0 +1,6 @@
+# generated at build time from the kernel's BTF
+vmlinux.h
+# build outputs
+*.o
+*.o.sha256
+bench/blast

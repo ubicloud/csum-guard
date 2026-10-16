@@ -1,0 +1,13 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License version 2, as published
+by the Free Software Foundation.
+
+The BPF program is licensed GPL-2.0 (see the SEC("license") string in
+csum_guard.bpf.c) because it uses GPL-only kernel helpers and kfuncs.
+
+The full text of the GNU General Public License version 2 is available at:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+Replace this file with the full license text before publishing the repo.
