@@ -1,6 +1,6 @@
 #!/bin/bash
-# attach.sh DEV [NETNS] - attach csum_guard at tc ingress of DEV on a live host.
-# detach.sh / "attach.sh DEV ... --detach" removes it.  Idempotent.
+# attach.sh DEV [NETNS] [--detach] - attach csum_guard at tc ingress of DEV on
+# a live host, or detach it.  Idempotent.
 #
 # On an Ubicloud host each VM NIC is a tap device inside the VM's own netns
 # (see rhizome/host/lib/vm_setup.rb: "ip -n <vm> tuntap add dev <tap> mode tap
@@ -9,11 +9,16 @@
 #
 #   ./attach.sh <tap> <vm-netns>
 #
-# Requires: tc (iproute2), bpftool, a kernel with bpf_cast_to_kern_ctx (>=6.3).
+# Every attachment shares one counters map, pinned at $CNT; it is kept when
+# the filter is detached, so the counts survive VM churn.
+#
+# Requires: tc (iproute2, built with libbpf), a kernel with
+# bpf_cast_to_kern_ctx (>= 6.3).  bpftool only to read the counters.
 set -euo pipefail
 
 OBJ=${OBJ:-$(cd "$(dirname "$0")" && pwd)/csum_guard.bpf.o}
-BPFTOOL=${BPFTOOL:-bpftool}
+CNT=/sys/fs/bpf/tc/globals/csum_guard_cnt
+PREF=49152
 DEV=${1:?usage: attach.sh DEV [NETNS] [--detach]}
 NETNS=""; DETACH=0
 shift || true
@@ -24,23 +29,18 @@ for a in "$@"; do
 	esac
 done
 
-# Run tc/bpftool inside the netns while keeping the host bpffs mount visible.
+# nsenter keeps the host bpffs visible; "tc -n" and "ip netns exec" remount
+# /sys, which would pin a private counters map per attachment.
 NS=(); [ -n "$NETNS" ] && NS=(nsenter --net=/run/netns/"$NETNS")
-PIN=/sys/fs/bpf/csum_guard_${NETNS:-root}_${DEV}
-
-mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
 
 if [ "$DETACH" = 1 ]; then
-	"${NS[@]}" tc filter del dev "$DEV" ingress 2>/dev/null || true
-	"${NS[@]}" tc qdisc del dev "$DEV" clsact 2>/dev/null || true
-	rm -rf "$PIN"
+	"${NS[@]}" tc filter del dev "$DEV" ingress pref $PREF 2>/dev/null || true
 	echo "detached from ${NETNS:+$NETNS/}$DEV"
 	exit 0
 fi
 
-rm -rf "$PIN"; mkdir -p "$PIN"
-$BPFTOOL prog load "$OBJ" "$PIN/prog" type tc pinmaps "$PIN/maps"
-"${NS[@]}" tc qdisc add dev "$DEV" clsact 2>/dev/null || true
-"${NS[@]}" tc filter replace dev "$DEV" ingress \
-	bpf object-pinned "$PIN/prog" direct-action
-echo "attached to ${NETNS:+$NETNS/}$DEV  (counters: bpftool map dump pinned $PIN/maps/counters)"
+mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
+"${NS[@]}" tc qdisc replace dev "$DEV" clsact
+"${NS[@]}" tc filter replace dev "$DEV" ingress pref $PREF handle 1 \
+	bpf direct-action object-file "$OBJ" section tc
+echo "attached to ${NETNS:+$NETNS/}$DEV  (counters: bpftool map dump pinned $CNT)"

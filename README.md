@@ -48,6 +48,11 @@ A legitimate `CHECKSUM_PARTIAL` packet always has `csum_start` at the
 transport header, i.e. at or past the end of the IP header, so the test
 never matches good traffic. Per-CPU counters record dropped packets.
 
+Every attachment on a host shares one counters map, which tc pins at
+`/sys/fs/bpf/tc/globals/csum_guard_cnt`. The counts outlive the devices,
+so drops on short-lived VMs are kept, and the map stays the same size
+however many devices are attached. They reset when the host reboots.
+
 This is defence in depth, same as the patch's own framing: the real fix is
 input validation, but a drop at the entry device removes the corruption
 primitive for the forwarding, IPsec, and netfilter paths on an unpatched or
@@ -129,12 +134,20 @@ the guest-controlled `virtio_net_hdr` enters:
 ./attach.sh <tap> <vm-netns> --detach # remove
 ```
 
-Inspect drops:
+Load with `nsenter --net`, not `tc -n` or `ip netns exec`: those remount
+`/sys`, so each load would pin a private counters map that dies with its
+device.
+
+Inspect drops, summed over every device on the host since boot:
 
 ```sh
-bpftool map dump pinned /sys/fs/bpf/csum_guard_<netns>_<dev>/maps/counters
+bpftool map dump pinned /sys/fs/bpf/tc/globals/csum_guard_cnt
 # index 0 = dropped, 1 = dropped (IP header not readable)
 ```
+
+The map definition is part of the pinned map's identity: libbpf refuses
+to reuse a pinned map whose definition differs, so a release that changes
+it must also rename it.
 
 Set `log_drops=1` at load for a `trace_pipe` line per drop.
 

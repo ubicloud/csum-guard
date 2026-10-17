@@ -42,6 +42,14 @@ const volatile __u32 log_drops = 0;
  * Only drops are counted.  A map lookup per inspected packet cost about
  * 6 ns on the CHECKSUM_PARTIAL path, which is the common path for a guest
  * with tx checksum offload; see README.
+ *
+ * Every attachment shares one map, pinned by name: tc pins it at
+ * /sys/fs/bpf/tc/globals/csum_guard_cnt.  The counts then outlive the
+ * devices, so drops on short-lived VMs are kept, and the map does not grow
+ * with the number of devices.  The loader must see the host's bpffs: use
+ * "nsenter --net", not "tc -n" or "ip netns exec", which remount /sys and
+ * so pin a private map per load.  libbpf refuses to reuse a pinned map
+ * whose definition differs, so a release that changes it must rename it.
  */
 enum {
 	CNT_DROP,	/* dropped: csum_start inside IP header */
@@ -54,11 +62,12 @@ struct {
 	__uint(max_entries, CNT_MAX);
 	__type(key, __u32);
 	__type(value, __u64);
-} counters SEC(".maps");
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} csum_guard_cnt SEC(".maps");
 
 static __always_inline void count(__u32 idx)
 {
-	__u64 *v = bpf_map_lookup_elem(&counters, &idx);
+	__u64 *v = bpf_map_lookup_elem(&csum_guard_cnt, &idx);
 
 	if (v)
 		(*v)++;

@@ -8,14 +8,16 @@
 #      and skips the live test with a GitHub warning (exit 0),
 #   4. attaches the filter at tc ingress of a tap and asserts, from the drop
 #      counters, that a packet with csum_start inside the IP header is dropped
-#      and a well-formed CHECKSUM_PARTIAL packet is not.
+#      and a well-formed CHECKSUM_PARTIAL packet is not,
+#   5. deletes the tap's netns and attaches to a new one, and asserts that
+#      the pinned counters kept their counts and are shared.
 #
 # Exit 0 = pass (including the old-kernel skip), non-zero = a real failure.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 DIR=$(cd "$HERE/.." && pwd)
-PIN=/sys/fs/bpf/csum_guard_ci
+CNT=/sys/fs/bpf/tc/globals/csum_guard_cnt
 NS=(nsenter --net=/run/netns/cgci)
 N=20
 
@@ -44,9 +46,8 @@ kernel_ge_63() {
 }
 
 cleanup() {
-	"${NS[@]}" tc qdisc del dev bt clsact 2>/dev/null || true
 	ip netns del cgci 2>/dev/null || true
-	rm -rf "$PIN"
+	rm -f "$CNT"
 }
 trap cleanup EXIT
 
@@ -68,27 +69,32 @@ if ! kernel_ge_63; then
 	exit 0
 fi
 
+setup() {  # a netns with a tap, the filter attached as rhizome does
+	ip netns add cgci
+	ip -n cgci link set lo up
+	ip -n cgci tuntap add dev bt mode tap vnet_hdr
+	ip -n cgci link set bt address 02:00:00:00:00:01 up
+	ip -n cgci addr add 10.0.0.1/24 dev bt
+	ip -n cgci route add blackhole 10.1.0.0/24
+	ip netns exec cgci sysctl -qw net.ipv4.ip_forward=1
+	ip -n cgci neigh replace 10.0.0.2 lladdr 02:00:00:00:00:02 dev bt
+	ip -n cgci link set bt up
+	tc -n cgci qdisc replace dev bt clsact
+	# nsenter keeps the host bpffs visible, so the counters map is shared.
+	"${NS[@]}" tc filter replace dev bt ingress pref 49152 handle 1 \
+		bpf direct-action object-file "$DIR/csum_guard.bpf.o" section tc
+}
+
 group "Attach"
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
-rm -rf "$PIN"; mkdir -p "$PIN"
-ip netns add cgci
-ip -n cgci link set lo up
-ip -n cgci tuntap add dev bt mode tap vnet_hdr
-ip -n cgci link set bt address 02:00:00:00:00:01 up
-ip -n cgci addr add 10.0.0.1/24 dev bt
-ip -n cgci route add blackhole 10.1.0.0/24
-ip netns exec cgci sysctl -qw net.ipv4.ip_forward=1
-ip -n cgci neigh replace 10.0.0.2 lladdr 02:00:00:00:00:02 dev bt
-# Load inside the netns, keeping the host bpffs mount visible.
-"${NS[@]}" env BPFTOOL="$BPFTOOL" PIN="$PIN" OBJ="$DIR/csum_guard.bpf.o" bash -c '
-	$BPFTOOL prog load "$OBJ" $PIN/prog type tc pinmaps $PIN/maps
-	tc qdisc add dev bt clsact
-	tc filter add dev bt ingress bpf object-pinned $PIN/prog direct-action'
+rm -f "$CNT"
+setup
+[ -e "$CNT" ] || die "counters not pinned at $CNT"
 note "attached"
 endgroup
 
 drops() {  # sum CNT_DROP (index 0) across CPUs
-	$BPFTOOL -j map dump pinned "$PIN/maps/counters" | python3 -c '
+	$BPFTOOL -j map dump pinned "$CNT" | python3 -c '
 import json,sys
 u=lambda b:int.from_bytes(bytes(int(x,16) for x in b),"little")
 d=json.load(sys.stdin)
@@ -119,4 +125,14 @@ note "good packets (CHECKSUM_PARTIAL, valid csum_start): $good_drop of $N droppe
 [ "$good_drop" -eq 0 ] || die "guard dropped $good_drop good packets, expected 0"
 endgroup
 
-note "PASS: bad dropped, good passed"
+group "Churn"
+before=$(drops)
+ip netns del cgci
+[ "$(drops)" -eq "$before" ] || die "counters changed when the netns was deleted"
+setup
+inject bad
+[ "$(drops)" -eq $((before + N)) ] || die "counters not shared with a new attachment: $(drops), expected $((before + N))"
+note "counters kept across netns deletion and shared: $(drops)"
+endgroup
+
+note "PASS: bad dropped, good passed, counters kept"

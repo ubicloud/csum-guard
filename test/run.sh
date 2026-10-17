@@ -9,11 +9,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 OBJ=$HERE/../csum_guard.bpf.o
 BPFTOOL=${BPFTOOL:-bpftool}
 PIN=/sys/fs/bpf/csum_guard_test
+# bpftool pins the program's counters map by name at the bpffs root.
+CNT=/sys/fs/bpf/csum_guard_cnt
 
 cleanup() {
 	ip netns del cg1 2>/dev/null
 	ip netns del cg2 2>/dev/null
-	rm -rf $PIN
+	rm -rf $PIN $CNT
 }
 cleanup
 trap cleanup EXIT
@@ -39,7 +41,7 @@ run_case() {
 	ip -n cg1 neigh replace 10.0.0.2 lladdr 02:00:00:00:00:02 dev cgtap
 	if [ "$guard" = on ]; then
 		mkdir -p $PIN
-		$BPFTOOL prog load "$OBJ" $PIN/prog type tc pinmaps $PIN/maps
+		$BPFTOOL prog load "$OBJ" $PIN/prog type tc
 		# nsenter keeps /sys/fs/bpf visible; "ip netns exec" remounts /sys.
 		nsenter --net=/run/netns/cg1 tc qdisc add dev cgtap clsact
 		nsenter --net=/run/netns/cg1 tc filter add dev cgtap ingress bpf object-pinned $PIN/prog direct-action
@@ -55,13 +57,13 @@ run_case() {
 	[ -s /tmp/cg_sniff.$$ ] || echo "   (none)"
 	if [ "$guard" = on ]; then
 		echo "   counters [drop, drop_short] summed over CPUs:"
-		$BPFTOOL -j map dump pinned $PIN/maps/counters |
+		$BPFTOOL -j map dump pinned $CNT |
 			python3 -c 'import json,sys
 def u64(b): return int.from_bytes(bytes(int(x,16) for x in b),"little")
 d=json.load(sys.stdin)
 print("  ", [sum(u64(v["value"]) for v in e["values"]) for e in d])'
 		nsenter --net=/run/netns/cg1 tc qdisc del dev cgtap clsact
-		rm -rf $PIN
+		rm -rf $PIN $CNT
 	fi
 	echo >&"${INJ[1]}"
 	wait $INJ_PID 2>/dev/null

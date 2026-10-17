@@ -11,10 +11,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 BPFTOOL=${BPFTOOL:-bpftool}
 N=${N:-2000000}; RUNS=${RUNS:-7}; CPU=${CPU:-1}
 PIN=/sys/fs/bpf/cg_bench
+# bpftool pins the program's counters map by name at the bpffs root.
+CNT=/sys/fs/bpf/csum_guard_cnt
 NS=(nsenter --net=/run/netns/bn)
 
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
-ip netns del bn 2>/dev/null; rm -rf $PIN; mkdir -p $PIN
+ip netns del bn 2>/dev/null; rm -rf $PIN $CNT; mkdir -p $PIN
 ip netns add bn
 ip -n bn tuntap add dev bt mode tap vnet_hdr
 ip -n bn link set bt address 02:00:00:00:00:01 up
@@ -22,7 +24,7 @@ ip -n bn addr add 10.0.0.1/24 dev bt
 ip -n bn route add blackhole 10.1.0.0/24
 ip netns exec bn sysctl -qw net.ipv4.ip_forward=1
 $BPFTOOL prog load "$HERE/pass.bpf.o" $PIN/pass type tc
-$BPFTOOL prog load "$HERE/../csum_guard.bpf.o" $PIN/guard type tc pinmaps $PIN/maps
+$BPFTOOL prog load "$HERE/../csum_guard.bpf.o" $PIN/guard type tc
 
 setcfg() {
 	"${NS[@]}" tc qdisc del dev bt clsact 2>/dev/null
@@ -68,7 +70,7 @@ PY
 done
 sysctl -qw kernel.bpf_stats_enabled=0
 echo "--- guard counters [drop, drop_short] ---"
-$BPFTOOL -j map dump pinned $PIN/maps/counters | python3 -c 'import json,sys
+$BPFTOOL -j map dump pinned $CNT | python3 -c 'import json,sys
 u=lambda b:int.from_bytes(bytes(int(x,16) for x in b),"little")
 print([sum(u(v["value"]) for v in e["values"]) for e in json.load(sys.stdin)])'
 echo "--- BPF_PROG_TEST_RUN, 10M repeats, median of 5, ns/run (ip_summed is NONE here) ---"
@@ -82,4 +84,4 @@ for prog in pass guard; do for pkt in v4 nonip; do
 	done | sort -n | sed -n 3p | xargs printf "%-6s %-6s %s ns/run\n" $prog $pkt
 done; done
 rm -rf $T
-setcfg none; ip netns del bn; rm -rf $PIN
+setcfg none; ip netns del bn; rm -rf $PIN $CNT
